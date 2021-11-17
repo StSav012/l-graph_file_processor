@@ -3,10 +3,11 @@ import configparser
 import os
 import sys
 from pathlib import Path
-from typing import List, Tuple, Union, Any, Dict, BinaryIO, cast, Mapping
+from typing import List, Tuple, Union, Any, Dict, BinaryIO, cast, Mapping, Optional
 
 import numpy as np
 import psutil  # type: ignore
+import scipy.signal  # type: ignore
 from matplotlib import pyplot as plt  # type: ignore
 from numpy.typing import NDArray
 
@@ -83,8 +84,7 @@ class Config:
         self.header: Final[bool] = c.getboolean('saving', 'header', fallback=True)
 
         self.save_initial_signal: Final[bool] = c.getboolean('initial signal', 'save', fallback=False)
-        self.save_initial_signal_file_name: Final[str] = c.get('initial signal', 'file name',
-                                                               fallback='IMPV')
+        self.save_initial_signal_file_name: Final[str] = c.get('initial signal', 'file name', fallback='IMPV')
 
         self.peak_files: Final[bool] = c.getboolean('peak files', 'save', fallback=True)
         self.peak_files_prefix: Final[str] = c.get('peak files', 'file name prefix', fallback='ALT_')
@@ -240,612 +240,669 @@ def main(c: Config) -> None:
         print('done')
 
 
-def process(filename: Path, c: Config) -> None:
-    def parameters_str() -> str:
-        s: str = ''
-        for parameter_name in parameters.parameter_names:
-            parameter_value: Any = getattr(parameters, parameter_name)
-            if isinstance(parameter_value, bytes):
-                parameter_value = parameter_value.decode()
-            s += f'{parameter_name.replace("_", " ")}: {parameter_value}\n'
-        return s
+class Processor:
+    def __init__(self, filename: Path, c: Config) -> None:
+        self.c: Config = c
 
-    def save_initial_signal() -> None:
-        if c.verbosity:
-            print('saving text ...', end='', flush=True)
-        utils.save_txt(saving_path / (c.save_initial_signal_file_name + c.saving_extension),
-                       np.column_stack((t.astype(np.single), sn.astype(np.single), sc.astype(np.single))),
-                       header=c.delimiter.join(('Time [s]', 'Signal [V]', 'Sync [V]')) if c.header else '',
-                       fmt=c.delimiter.join(('%.7f', '%.8f', '%.8f')),
-                       newline=os.linesep, encoding='utf-8')
-        if c.verbosity:
-            print(' done')
-
-    def save_parameters() -> None:
-        with (saving_path / 'parameters.txt').open('w', encoding='utf-8') as f_out:
-            f_out.write(parameters_str())
-            f_out.write(str(c))
-
-    def save_statistics() -> None:
-        statistics_file_path: Path
-        if c.statistics_file_path.suffix == c.saving_extension:
-            statistics_file_path = c.statistics_file_path
+        self.saving_path: Path
+        self.source_file_name: Path
+        pars_file_name: Path
+        if filename.suffix.lower() == DAT_SUFFIX:
+            self.saving_path = filename.with_suffix('') / self.c.saving_directory
+            # файл исходных бинарных данных
+            self.source_file_name = filename
+            # файл параметров файла данных
+            pars_file_name = filename.with_suffix(PAR_SUFFIX)
         else:
-            statistics_file_path = c.statistics_file_path.with_name(c.statistics_file_path.name + c.saving_extension)
-        if c.verbosity > 1:
-            print('saving statistics to', statistics_file_path)
-        if not statistics_file_path.exists():
-            with statistics_file_path.open('w', encoding='utf-8') as f_out:
-                f_out.write(c.delimiter.join(stat.keys()) + '\n')
-        with statistics_file_path.open('a', encoding='utf-8') as f_out:
-            f_out.write(c.delimiter.join(map(str, stat.values())) + '\n')
+            self.saving_path = filename.with_name(filename.name + '_result') / self.c.saving_directory
+            # файл исходных бинарных данных
+            self.source_file_name = filename.with_name(filename.name + DAT_SUFFIX)
+            # файл параметров файла данных
+            pars_file_name = filename.with_name(filename.name + PAR_SUFFIX)
+        if not self.source_file_name.exists() or not pars_file_name.exists():
+            return
+        self.saving_path.mkdir(exist_ok=True, parents=True)
 
-    def alt() -> Dict[str, Union[float, int, NDArray[np.float_]]]:
-        h_t: Final[float] = c.min_depth * 2. / SOUND_SPEED
-        h_max_t: Final[float] = c.max_depth * 2. / SOUND_SPEED
+        fp_pars_file: BinaryIO
+        with pars_file_name.open('rb') as fp_pars_file:
+            # пробуем зачитать файл параметров
+            self.parameters: utils.LCardParameters = utils.LCardParameters(fp_pars_file)
 
-        na: int
+        fp_source_file: BinaryIO
+        self.t: NDArray[np.float_] = np.full(self.parameters.frames_count, np.nan)
+        self.sn: NDArray[np.float_] = np.full(self.parameters.frames_count, np.nan)
+        self.sc: NDArray[np.float_] = np.full(self.parameters.frames_count, np.nan)
+        self.samples_count_portion: int = round(psutil.virtual_memory().available / self.parameters.DATA_TYPE_SIZE / 16)
 
-        def save_peaks() -> None:
-            def save_peak() -> None:
-                if c.verbosity > 1:
-                    # display progress
-                    print(f'\r{_first_signal_index / first_signal_indexes[-1]:7.2%}', end='', flush=True)
-                np.savetxt(saving_path / f'{c.peak_files_prefix}{len(ts):0{index_width}}{c.saving_extension}',
-                           np.column_stack((ts[-1], sns[-1])),
-                           header=os.linesep.join((c.delimiter.join(('dt', 'sn')), f't0 = {_t0}')) if c.header else '',
-                           fmt=('%.6f', '%.6f'),
-                           delimiter=c.delimiter, newline=os.linesep, encoding='utf-8')
+        # read data frames
+        with self.source_file_name.open('rb', buffering=self.samples_count_portion) as fp_source_file:
+            if self.c.verbosity:
+                print('Processing', self.source_file_name)
+                if self.c.verbosity > 1:
+                    print(str(self.parameters))
+            sc_frame_number: int = 0
+            sn_frame_number: int = 0
+            remaining_samples_count: int = self.parameters.samples_count
+            ch: int = 0
+            while remaining_samples_count > 0:
+                # прочитаем из файла очередную порция бинарных данных
+                data_buffer = utils.read_numpy_array(fp_source_file, self.parameters.DATA_NUMPY_TYPE,
+                                                     self.parameters.samples_count % self.samples_count_portion)
+                actual_samples_count: int = data_buffer.size
+                sc_frame_count: int = ((actual_samples_count + ch) // self.parameters.channels_count
+                                       - (ch > self.c.sync_channel)
+                                       + ((actual_samples_count + ch)
+                                          % self.parameters.channels_count > self.c.sync_channel)
+                                       )
+                sn_frame_count: int = ((actual_samples_count + ch) // self.parameters.channels_count
+                                       - (ch > self.c.signal_channel)
+                                       + ((actual_samples_count + ch)
+                                          % self.parameters.channels_count > self.c.signal_channel)
+                                       )
 
-            def save_peak_plot() -> None:
-                if c.verbosity > 1:
-                    print('saving plot for peak', c.peak_plot_number)
-                fig, ax = plt.subplots()
-                fig.set_size_inches(c.peak_plot_width, c.peak_plot_height, forward=True)
-                fig.set_dpi(c.peak_plot_dpi)
-                ax.plot(ts[-1], sns[-1], color=c.peak_plot_line_color)
-                if c.peak_plot_x_grid:
-                    ax.grid(axis='x')
-                if c.peak_plot_y_grid:
-                    ax.grid(axis='y')
-                ax.set_xlabel('Время, с')
-                ax.set_ylabel('Сигнал, В')
-                fig.tight_layout()
-                (saving_path / c.img_directory).mkdir(exist_ok=True, parents=True)
-                fig.savefig(saving_path / c.img_directory / f'{c.peak_plot_file_name}.{c.peak_plot_file_format}',
-                            bbox_inches='tight')
-                plt.close(fig)
+                self.sc[sc_frame_number:sc_frame_number + sc_frame_count] = \
+                    data_buffer[(self.parameters.channels_count - ch + self.c.sync_channel)
+                                % self.parameters.channels_count::
+                                self.parameters.channels_count]
+                self.sn[sn_frame_number:sn_frame_number + sn_frame_count] = \
+                    data_buffer[(self.parameters.channels_count - ch + self.c.signal_channel)
+                                % self.parameters.channels_count::
+                                self.parameters.channels_count]
 
-            index_width: int = len(str(init_start_indices_size))
-            max_signal_duration: int = max(signal_durations)
-            if c.peak_files and c.verbosity > 1:
-                print('saving peaks')
-            for _first_signal_index, _t0 in zip(first_signal_indexes, t0s):
-                _last_signal_index: int = _first_signal_index + max_signal_duration
-                ts.append(t[_first_signal_index:_last_signal_index] - _t0)
-                sns.append(sn[_first_signal_index:_last_signal_index])
+                sc_frame_number += sc_frame_count
+                sn_frame_number += sn_frame_count
 
-                if c.peak_files:
-                    save_peak()
+                ch = (ch + actual_samples_count) % self.parameters.channels_count
 
-                if c.peak_plot and len(sns) == c.peak_plot_number:
-                    save_peak_plot()
+                if not actual_samples_count:
+                    print('Unexpected end of file', self.source_file_name)
+                    break
 
-            if c.verbosity > 1:
-                print('\r' + ' ' * 8 + '\r', end='', flush=True)
+                remaining_samples_count -= actual_samples_count
+            self.t[:sc_frame_number] = np.arange(sc_frame_number) * 1e-3 / self.parameters.channel_rate
+        self.sc += self.parameters.correction_offset[0]
+        self.sn += self.parameters.correction_offset[0]
+        if not self.parameters.RESCALING_REQUIRED:
+            self.sc *= self.parameters.correction_factor[0]
+            self.sn *= self.parameters.correction_factor[0]
+        elif self.parameters.MAX_ADC_CODE:
+            self.sc *= (self.parameters.correction_factor[0]
+                        / self.parameters.MAX_ADC_CODE * self.parameters.MAX_ADC_VOLTAGE)
+            self.sn *= (self.parameters.correction_factor[0]
+                        / self.parameters.MAX_ADC_CODE * self.parameters.MAX_ADC_VOLTAGE)
 
-        def save_peaks_parameters() -> None:
-            if c.verbosity > 1:
-                print('saving peaks parameters')
-            np.savetxt(saving_path / (c.peak_parameters_file_name + c.saving_extension),
-                       np.column_stack((times,
-                                        norms,
-                                        mws,
-                                        disps,
-                                        m4s,
-                                        maximum_sns,
-                                        maximum_time_to_hs)),
-                       header=c.delimiter.join('TIME NORM MW DISP M4 MAXSN TIMEMAXS'.split()) if c.header else '',
-                       fmt='%s',
-                       delimiter=c.delimiter, newline=os.linesep, encoding='utf-8')
 
-        def save_peaks_parameters_plots() -> None:
-            if c.verbosity > 1:
-                print('saving peaks parameters plots')
-            for peak_parameter, ax_label in zip(
-                    (norms,
-                     mws,
-                     disps,
-                     m4s,
-                     maximum_sns,
-                     maximum_time_to_hs),
-                    'NORM MW DISP M4 MAXSN TIMEMAXS'.split()
-            ):
-                fig, ax = plt.subplots()
-                fig.set_size_inches(c.peak_parameters_plots_width, c.peak_parameters_plots_height, forward=True)
-                fig.set_dpi(c.peak_parameters_plots_dpi)
-                ax.plot(times, peak_parameter, color=c.peak_parameters_plots_line_color)
-                if c.peak_parameters_plots_x_grid:
-                    ax.grid(axis='x')
-                if c.peak_parameters_plots_y_grid:
-                    ax.grid(axis='y')
-                ax.set_xlabel('Время, с')
-                # TODO: set y label
-                fig.tight_layout()
-                (saving_path / c.img_directory).mkdir(exist_ok=True, parents=True)
-                fig.savefig(saving_path / c.img_directory / f'{ax_label}.{c.peak_parameters_plots_file_format}',
-                            bbox_inches='tight')
-                plt.close(fig)
+def k_f(f15: NDArray[np.float_]) -> NDArray[np.float_]:
+    water_surface_tension: Final[float] = 0.000074  # [N/mm]
+    g: Final[float] = 9.8  # [m/s²]
 
-        def save_averaged_peaks() -> None:
-            index_width: int = len(str(t0s.size // na))
-            if c.verbosity > 1:
-                print('saving averaged peaks')
-            for i, n in enumerate(range(0, t0s.size, na)):
-                _signal_time = np.mean(ts[n:na + n], axis=0)
-                _signal = np.mean(sns[n:na + n], axis=0)
-                np.savetxt(saving_path / f'{c.averaged_peaks_files_prefix}{i + 1:0{index_width}}{c.saving_extension}',
-                           np.column_stack((_signal_time, _signal)),
-                           header=(os.linesep.join((c.delimiter.join(('dt', 'sn')), f'time = {np.mean(_signal_time)}'))
-                                   if c.header else ''),
-                           fmt=('%.6f', '%.6f'),
-                           delimiter=c.delimiter, newline=os.linesep, encoding='utf-8')
+    _omega_squared: Final[NDArray[np.float_]] = np.square(2.0 * np.pi * f15)  # [1/s²]
+    q15: Final[NDArray[np.float_]] = ((g / water_surface_tension / 3) ** 3
+                                      + np.square(_omega_squared / water_surface_tension / 2))
+    k15: Final[NDArray[np.float_]] = (np.cbrt(np.sqrt(q15) + _omega_squared / water_surface_tension / 2)
+                                      - np.cbrt(np.sqrt(q15) - _omega_squared / water_surface_tension / 2))
+    return k15
 
-        def save_averaged_peaks_parameters() -> None:
-            if c.verbosity > 1:
-                print('saving averaged peaks parameters')
-            with ((saving_path / (c.averaged_peaks_parameters_file_name + c.saving_extension))
-                    .open('w', encoding='utf-8')) as f_out:
-                if c.header:
-                    f_out.write(c.delimiter.join('TIME NORM MW DISP M4 MAXSN TIMEMAXS'.split()) + '\n')
-                for i, n in enumerate(range(0, t0s.size, na)):
-                    av_pars_dict = av_pars(n, na + n)
-                    f_out.write(c.delimiter.join(map(str, av_pars_dict.values())) + '\n')
 
-        def save_averaged_peaks_plots() -> None:
-            if c.verbosity > 1:
-                print('saving averaged peaks plots')
-            for i, n in enumerate(range(0, t0s.size, na)):
-                _signal_time = np.mean(ts[n:na + n], axis=0)
-                _signal = np.mean(sns[n:na + n], axis=0)
-                fig, ax = plt.subplots()
-                fig.set_size_inches(c.averaged_peak_plots_width, c.averaged_peak_plots_height, forward=True)
-                fig.set_dpi(c.averaged_peak_plots_dpi)
-                ax.plot(_signal_time, _signal, color=c.averaged_peak_plots_line_color)
-                if c.averaged_peak_plots_x_grid:
-                    ax.grid(axis='x')
-                if c.averaged_peak_plots_y_grid:
-                    ax.grid(axis='y')
-                ax.set_xlabel('Время, с')
-                ax.set_ylabel('Сигнал, В')
-                fig.tight_layout()
-                (saving_path / c.img_directory).mkdir(exist_ok=True, parents=True)
-                fig.savefig(saving_path / c.img_directory
-                            / f'{c.averaged_peak_plots_file_name_prefix}{i + 1}.{c.psd_plot_file_format}',
-                            bbox_inches='tight')
-                plt.close(fig)
+class RLS(Processor):
+    def __init__(self, filename: Path, c: Config, time: NDArray[np.float_], ht: NDArray[np.float_]) -> None:
+        super().__init__(filename, c)
 
-        def rls(time: NDArray[np.float_], ht: NDArray[np.float_]) -> Mapping[str, float]:
-            from scipy import signal  # type: ignore
+        self.time: NDArray[np.float_] = time
+        self.ht: NDArray[np.float_] = ht
 
-            t_r2: float = time[-1] - time[-2]
-            ht -= np.mean(ht)
-            ht *= c.calibration_factor
+        self.t_r2: float = self.time[-1] - self.time[-2]
+        self.ht -= np.mean(self.ht)
+        self.ht *= self.c.calibration_factor
 
-            f: NDArray[np.float_]
-            pn_xx: NDArray[np.float_]
-            f, pn_xx = signal.welch(ht, 1. / t_r2, window=(c.psd_window, *c.psd_window_parameters),
-                                    # nperseg=ht.size,
-                                    average=c.psd_averaging_mode
-                                    )
-            pn_xx = pn_xx[f <= c.psd_max_frequency]
-            f = f[f <= c.psd_max_frequency]
-            sp: Final[NDArray[np.float_]] = np.multiply(pn_xx, 2.0 * t_r2)
+        self.f: NDArray[np.float_]
+        self.pn_xx: NDArray[np.float_]
+        self.f, self.pn_xx = scipy.signal.welch(self.ht, 1. / self.t_r2,
+                                                window=(self.c.psd_window, *self.c.psd_window_parameters),
+                                                # nperseg=ht.size,
+                                                average=self.c.psd_averaging_mode
+                                                )
+        self.pn_xx = self.pn_xx[self.f <= self.c.psd_max_frequency]
+        self.f = self.f[self.f <= self.c.psd_max_frequency]
+        self.sp: Final[NDArray[np.float_]] = np.multiply(self.pn_xx, 2.0 * self.t_r2)
 
-            def save_psd() -> None:
-                if c.verbosity > 1:
-                    print('saving spectrum')
-                np.savetxt(saving_path / (c.psd_file_name + c.saving_extension), np.column_stack((f, sp)),
-                           header=c.delimiter.join(('Frequency [Hz]', 'PSD [V²/Hz]')) if c.header else '',
-                           delimiter=c.delimiter, newline=os.linesep, encoding='utf-8')
+        self.dvtt: NDArray[np.float_] = (self.ht[1:] - self.ht[:-1]) / (self.time[1:] - self.time[:-1])
 
-            def save_psd_plot() -> None:
-                if c.verbosity > 1:
-                    print('saving spectrum plot')
-                fig, ax = plt.subplots()
-                fig.set_size_inches(c.psd_plot_width, c.psd_plot_height, forward=True)
-                fig.set_dpi(c.psd_plot_dpi)
-                ax.plot(f, sp, color=c.psd_plot_line_color)
-                if c.psd_plot_x_grid:
-                    ax.grid(axis='x')
-                if c.psd_plot_y_grid:
-                    ax.grid(axis='y')
-                ax.set_xlabel('Частота, Гц')
-                ax.set_ylabel('Спектральная плотность мощности, В²/Гц')
-                fig.tight_layout()
-                (saving_path / c.img_directory).mkdir(exist_ok=True, parents=True)
-                fig.savefig(saving_path / c.img_directory / f'{c.psd_plot_file_name}.{c.psd_plot_file_format}',
-                            bbox_inches='tight')
-                plt.close(fig)
+        self.df: NDArray[np.float_] = self.f[1:] - self.f[:-1]
 
-            def save_rolling_psd() -> None:
-                def save_averaged_rolling_psd() -> None:
-                    if c.verbosity > 1:
-                        print('saving averaged rolling spectra')
-                    if rolling_pn_xxs is not None:
-                        np.savetxt(saving_path / f'{c.rolling_psd_averaged_file_name}{c.saving_extension}',
-                                   np.column_stack((rolling_f, 2.0 * rolling_pn_xxs * t_r2 / i)),
-                                   header=c.delimiter.join(('Frequency [Hz]', 'PSD [V²/Hz]')) if c.header else '',
-                                   delimiter=c.delimiter, newline=os.linesep, encoding='utf-8')
-                    else:
-                        print('ERROR: no rolling spectra has been calculated yet')
+        self.k = k_f(self.f)
+        self.integrals_dict: Dict[str, float] = self.integrals()
 
-                if c.verbosity > 1:
-                    print('saving rolling spectra')
+    def integrals(self) -> Dict[str, float]:
+        sigma_hs: float = cast(float, np.sum(self.sp[1:] * self.df))
+        sigma_h: float = cast(float, np.square(np.std(self.ht)))
+        integral: float = cast(float, np.sum(self.sp[1:] * np.square(2. * np.pi * self.f[1:]) * self.df))
+        disp_vtt: float = cast(float, np.square(np.std(self.dvtt)))
+        integral1: float = cast(float, np.sum(self.sp[1:] * np.square(self.k[1:]) * self.df))
+        integral2: float = cast(float, np.sum(self.sp[1:] * self.k[1:] * 2. * np.pi * self.f[1:] * self.df))
 
-                rolling_psd_window: float
-                if c.rolling_psd_window.endswith('%'):
-                    rolling_psd_window = float(c.rolling_psd_window.rstrip('%')) / 100. / f[np.argmax(pn_xx)]
-                else:
-                    rolling_psd_window = float(c.rolling_psd_window)
-                if rolling_psd_window < t_r2:
-                    rolling_psd_window = 1. / f[np.argmax(pn_xx)]
+        f_shift: float = cast(float, np.sum(self.f[1:] * self.sp[1:] * self.df) / sigma_hs)
+        delta_f: float = cast(float, 2.0 * np.sqrt(np.sum(np.square(self.f[1:]) * self.sp[1:] * self.df)
+                                                   / sigma_hs - f_shift ** 2))
+        mu_2: float = cast(float, np.sum((self.f[1:] - self.f[1:].mean()) ** 2 * self.sp[1:] * self.df))
+        mu_3: float = cast(float, np.sum((self.f[1:] - self.f[1:].mean()) ** 3 * self.sp[1:] * self.df))
+        mu_4: float = cast(float, np.sum((self.f[1:] - self.f[1:].mean()) ** 4 * self.sp[1:] * self.df))
+        delta_f_42: float = cast(float, 2.0 * np.sqrt(mu_4 / mu_2))
+        a: float = mu_3 / mu_2
+        e: float = mu_4 / mu_2 ** 2 - 3.0
+        return dict(zip(
+            (
+                'Время_записи',
+                'ДиспВысСпектр', '4*корень(ДиспВысСпектр)',
+                'ДиспВысПроц', '4*корень(ДиспВысПроц)',
+                'ДиспСкорСпектр',
+                'ДиспСкорПроц',
+                'Наклоны',
+                'ВзКор',
 
-                rolling_psd_window_shift: float
-                if c.rolling_psd_window_shift.endswith('%'):
-                    rolling_psd_window_shift = float(
-                        c.rolling_psd_window_shift.rstrip('%')) / 100. * rolling_psd_window
-                else:
-                    rolling_psd_window_shift = float(c.rolling_psd_window_shift)
+                'F_shift',
+                'ΔF',
+                'ΔF_42',
+                'A',
+                'E',
+            ),
+            (
+                cast(float, np.max(self.time)),
+                sigma_hs, 4.0 * cast(float, np.sqrt(sigma_hs)),
+                sigma_h, 4.0 * cast(float, np.sqrt(sigma_h)),
+                integral,
+                disp_vtt,
+                integral1,
+                integral2,
 
-                index_width: int = len(str(int((time[-1] - time[0] - rolling_psd_window) / rolling_psd_window_shift)))
-                i: int = 1
-                rolling_psd_window_start: float = time[0]
-                rolling_psd_window_end: float = rolling_psd_window_start + rolling_psd_window
-                rolling_pn_xxs: Union[None, NDArray[np.float_]] = None
-                rolling_f: Union[None, NDArray[np.float_]] = None
-                rolling_psd_averaging_failed: bool = False
-                while time[-1] >= rolling_psd_window_end:
-                    rolling_ht: NDArray[np.float_] = \
-                        ht[np.argwhere((time >= rolling_psd_window_start) & (time <= rolling_psd_window_end)).ravel()]
-                    rolling_f, rolling_pn_xx = signal.welch(rolling_ht, 1. / t_r2,
-                                                            window=(c.psd_window, *c.psd_window_parameters),
-                                                            nperseg=rolling_ht.size,
-                                                            average=c.psd_averaging_mode)
-                    if rolling_pn_xxs is None:
-                        rolling_pn_xxs = rolling_pn_xx
-                    elif rolling_pn_xxs.shape == rolling_pn_xx.shape:
-                        rolling_pn_xxs += rolling_pn_xx
-                    else:
-                        rolling_psd_averaging_failed = True
-                    np.savetxt(saving_path / f'{c.rolling_psd_files_prefix}{i:0{index_width}}{c.saving_extension}',
-                               np.column_stack((rolling_f, 2 * rolling_pn_xx * t_r2)),
-                               header=os.linesep.join(
-                                   (c.delimiter.join(('Frequency [Hz]', 'PSD [V²/Hz]')),
-                                    f'time from {rolling_psd_window_start} to {rolling_psd_window_end} [s]')
-                               ) if c.header else '',
-                               delimiter=c.delimiter, newline=os.linesep, encoding='utf-8')
-                    rolling_psd_window_start += rolling_psd_window_shift
-                    rolling_psd_window_end = rolling_psd_window_start + rolling_psd_window
-                    i += 1
-                if not rolling_psd_averaging_failed and rolling_f is not None and rolling_pn_xxs is not None:
-                    save_averaged_rolling_psd()
+                f_shift,
+                delta_f,
+                delta_f_42,
+                a,
+                e,
+            )
+        ))
 
-            def save_psd_statistics() -> None:
-                if c.verbosity > 1:
-                    print('saving spectrum statistics')
-                np.savetxt(saving_path / (c.psd_statistics_file_name + c.saving_extension),
-                           np.column_stack((f, sp,
-                                            np.square(2. * np.pi * f) * sp,
-                                            np.square(k) * sp,
-                                            np.power(k, 4) * sp)),
-                           header=c.delimiter.join(('Частота', 'Спектр_возвышений', 'Спектр_скоростей',
-                                                    'Спектр_наклонов', 'Спектр_кривизн')) if c.header else '',
-                           delimiter=c.delimiter, newline=os.linesep, encoding='utf-8')
+    def rls(self) -> Mapping[str, float]:
+        return self.integrals_dict
 
-            def k_f(f15: NDArray[np.float_]) -> NDArray[np.float_]:
-                water_surface_tension: Final[float] = 0.000074  # [N/mm]
-                g: Final[float] = 9.8  # [m/s²]
 
-                _omega_squared: Final[NDArray[np.float_]] = np.square(2.0 * np.pi * f15)  # [1/s²]
-                q15: Final[NDArray[np.float_]] = ((g / water_surface_tension / 3) ** 3
-                                                  + np.square(_omega_squared / water_surface_tension / 2))
-                k15: Final[NDArray[np.float_]] = (np.cbrt(np.sqrt(q15) + _omega_squared / water_surface_tension / 2)
-                                                  - np.cbrt(np.sqrt(q15) - _omega_squared / water_surface_tension / 2))
-                return k15
+class Altimeter(Processor):
+    def __init__(self, filename: Path, c: Config) -> None:
+        super().__init__(filename, c)
 
-            def integrals() -> Dict[str, float]:
-                sigma_hs: float = cast(float, np.sum(sp[1:] * df))
-                sigma_h: float = cast(float, np.square(np.std(ht)))
-                integral: float = cast(float, np.sum(sp[1:] * np.square(2. * np.pi * f[1:]) * df))
-                disp_vtt: float = cast(float, np.square(np.std(dvtt)))
-                integral1: float = cast(float, np.sum(sp[1:] * np.square(k[1:]) * df))
-                integral2: float = cast(float, np.sum(sp[1:] * k[1:] * 2. * np.pi * f[1:] * df))
+        self.h_t: Final[float] = self.c.min_depth * 2. / SOUND_SPEED
+        h_max_t: Final[float] = self.c.max_depth * 2. / SOUND_SPEED
 
-                f_shift: float = cast(float, np.sum(f[1:] * sp[1:] * df) / sigma_hs)
-                delta_f: float = cast(float, 2.0 * np.sqrt(np.sum(np.square(f[1:]) * sp[1:] * df)
-                                                           / sigma_hs - f_shift ** 2))
-                mu_2: float = cast(float, np.sum((f[1:] - f[1:].mean()) ** 2 * sp[1:] * df))
-                mu_3: float = cast(float, np.sum((f[1:] - f[1:].mean()) ** 3 * sp[1:] * df))
-                mu_4: float = cast(float, np.sum((f[1:] - f[1:].mean()) ** 4 * sp[1:] * df))
-                delta_f_42: float = cast(float, 2.0 * np.sqrt(mu_4 / mu_2))
-                a: float = mu_3 / mu_2
-                e: float = mu_4 / mu_2 ** 2 - 3.0
-                return dict(zip(
-                    (
-                        'Время_записи',
-                        'ДиспВысСпектр', '4*корень(ДиспВысСпектр)',
-                        'ДиспВысПроц', '4*корень(ДиспВысПроц)',
-                        'ДиспСкорСпектр',
-                        'ДиспСкорПроц',
-                        'Наклоны',
-                        'ВзКор',
-
-                        'F_shift',
-                        'ΔF',
-                        'ΔF_42',
-                        'A',
-                        'E',
-                    ),
-                    (
-                        cast(float, np.max(time)),
-                        sigma_hs, 4.0 * cast(float, np.sqrt(sigma_hs)),
-                        sigma_h, 4.0 * cast(float, np.sqrt(sigma_h)),
-                        integral,
-                        disp_vtt,
-                        integral1,
-                        integral2,
-
-                        f_shift,
-                        delta_f,
-                        delta_f_42,
-                        a,
-                        e,
-                    )
-                ))
-
-            def save_integrals() -> None:
-                if c.verbosity > 1:
-                    print('saving integrals')
-                np.savetxt(saving_path / (c.integrals_file_name + c.saving_extension),
-                           np.column_stack(integrals_dict.values()),
-                           header=c.delimiter.join(integrals_dict.keys()) if c.header else '',
-                           delimiter=c.delimiter, newline=os.linesep, encoding='utf-8')
-
-            if c.psd:
-                save_psd()
-
-            if c.psd_plot:
-                save_psd_plot()
-
-            if c.rolling_psd:
-                save_rolling_psd()
-
-            dvtt: NDArray[np.float_] = (ht[1:] - ht[:-1]) / (time[1:] - time[:-1])
-
-            df: NDArray[np.float_] = f[1:] - f[:-1]
-
-            k = k_f(f)
-            if c.psd_statistics:
-                save_psd_statistics()
-
-            integrals_dict: Dict[str, float] = integrals()
-            if c.integrals:
-                save_integrals()
-            return integrals_dict
-
-        def av_pars(n_init: int = 0, n_fin: Union[None, int] = None) -> Dict[str, float]:
-            _signal_time = np.mean(ts[n_init:n_fin], axis=0)
-            _signal = np.mean(sns[n_init:n_fin], axis=0)
-            _dt = abs(_signal_time[-1] - h_t)
-            _norm = _dt * np.mean(_signal)
-            _mw = _dt * np.mean(_signal_time * _signal) / _norm
-            _disp = _dt * np.mean(np.square(_signal_time) * _signal) / _norm - np.square(_mw)
-            _m4 = _dt * np.mean(np.power(_signal_time, 4) * _signal) / _norm
-            _m4 = np.sqrt(np.square(12. * np.square(_mw)) - (np.power(_mw, 4) - _m4) / 3.)
-            _arg_max_sn = np.argmax(_signal)
-            _maximum_sn = _signal[_arg_max_sn]
-            _maximum_time = _signal_time[_arg_max_sn]
-            return dict(zip(
-                'TIME NORM MW DISP M4 MAXSN TIMEMAXS'.split(),
-                (
-                    np.mean(_signal_time) + t0s[na + n_init - 1],
-                    _norm,
-                    _mw,
-                    _disp,
-                    _m4,
-                    _maximum_sn,
-                    SOUND_SPEED * _maximum_time / 2.,
-                )
-            ))
-
-        start_indices = np.argwhere((sc[1:] > c.sync_threshold) & (sc[:-1] <= c.sync_threshold)).ravel()
-        init_start_indices_size: int = start_indices.size
-        t0s: NDArray[np.float_] = np.empty(0)
-        ts: List[NDArray[np.float_]] = []
-        sns: List[NDArray[np.float_]] = []
-        first_signal_indexes: List[int] = []
-        signal_durations: List[int] = []
+        start_indices = np.argwhere((self.sc[1:] > self.c.sync_threshold)
+                                    & (self.sc[:-1] <= self.c.sync_threshold)).ravel()
+        self.init_start_indices_size: int = start_indices.size
+        self.t0s: NDArray[np.float_] = np.empty(0)
+        self.ts: List[NDArray[np.float_]] = []
+        self.sns: List[NDArray[np.float_]] = []
+        self.first_signal_indexes: List[int] = []
+        self.signal_durations: List[int] = []
         while start_indices.size:
-            t0 = t[start_indices[0] + 1]
-            if t[-1] < h_max_t + t0:
+            t0 = self.t[start_indices[0] + 1]
+            if self.t[-1] < h_max_t + t0:
                 break
-            t0s = np.append(t0s, t0)
-            first_signal_index = np.searchsorted(t, h_t + t0, side='right')
-            last_signal_index = np.searchsorted(t, h_max_t + t0, side='right')
-            first_signal_indexes.append(first_signal_index)
-            signal_durations.append(last_signal_index - first_signal_index)
+            self.t0s = np.append(self.t0s, t0)
+            first_signal_index = np.searchsorted(self.t, self.h_t + t0, side='right')
+            last_signal_index = np.searchsorted(self.t, h_max_t + t0, side='right')
+            self.first_signal_indexes.append(first_signal_index)
+            self.signal_durations.append(last_signal_index - first_signal_index)
             start_indices = start_indices[start_indices > last_signal_index]
-
-        save_peaks()
 
         index: int
         start_time: float
         signal_time: NDArray[np.float_]
         signal: NDArray[np.float_]
 
+        max_signal_duration: int = max(self.signal_durations)
+        if self.c.peak_files and self.c.verbosity > 1:
+            print('saving peaks')
+        for index, (first_signal_index, t0) in enumerate(zip(self.first_signal_indexes, self.t0s)):
+            _last_signal_index: int = first_signal_index + max_signal_duration
+            self.ts.append(self.t[first_signal_index:_last_signal_index] - t0)
+            self.sns.append(self.sn[first_signal_index:_last_signal_index])
+
         arg_max_sns: List[int] = []
         arg_max_sn: int
-        for signal_time, signal in zip(ts, sns):
+        for signal_time, signal in zip(self.ts, self.sns):
             arg_max_sn = cast(int, np.argmax(signal))
             arg_max_sns.append(arg_max_sn)
-        times: NDArray[np.float_] = np.empty(len(arg_max_sns))
-        maximum_sns: NDArray[np.float_] = np.empty(len(arg_max_sns))
+        self.times: NDArray[np.float_] = np.empty(len(arg_max_sns))
+        self.maximum_sns: NDArray[np.float_] = np.empty(len(arg_max_sns))
         maximum_times: NDArray[np.float_] = np.empty(len(arg_max_sns))
-        norms: NDArray[np.float_] = np.empty(len(arg_max_sns))
-        mws: NDArray[np.float_] = np.empty(len(arg_max_sns))
-        disps: NDArray[np.float_] = np.empty(len(arg_max_sns))
-        m4s: NDArray[np.float_] = np.empty(len(arg_max_sns))
+        self.norms: NDArray[np.float_] = np.empty(len(arg_max_sns))
+        self.mws: NDArray[np.float_] = np.empty(len(arg_max_sns))
+        self.disps: NDArray[np.float_] = np.empty(len(arg_max_sns))
+        self.m4s: NDArray[np.float_] = np.empty(len(arg_max_sns))
 
-        for index, (start_time, signal_time, signal, arg_max_sn) in enumerate(zip(t0s, ts, sns, arg_max_sns)):
-            times[index] = np.mean(signal_time) + start_time
-            maximum_sns[index] = signal[arg_max_sn]
+        for index, (start_time, signal_time, signal, arg_max_sn) \
+                in enumerate(zip(self.t0s, self.ts, self.sns, arg_max_sns)):
+            self.times[index] = np.mean(signal_time) + start_time
+            self.maximum_sns[index] = signal[arg_max_sn]
             maximum_times[index] = signal_time[arg_max_sn]
-            dt = abs(signal_time[-1] - h_t)
-            norms[index] = dt * np.mean(signal)
-            mws[index] = dt * np.mean(signal_time * signal) / norms[index]
-            disps[index] = dt * np.mean(np.square(signal_time) * signal) / norms[index] - np.square(mws[index])
-            m4s[index] = dt * np.mean(np.power(signal_time, 4) * signal) / norms[index]
-            m4s[index] = np.sqrt((12. * np.square(mws[index])) ** 2 - (np.power(mws[index], 4) - m4s[index]) / 3.)
-        maximum_time_to_hs: NDArray[np.float_] = np.multiply(maximum_times, SOUND_SPEED / 2.)
+            dt = abs(signal_time[-1] - self.h_t)
+            self.norms[index] = dt * np.mean(signal)
+            self.mws[index] = dt * np.mean(signal_time * signal) / self.norms[index]
+            self.disps[index] = dt * (np.mean(np.square(signal_time) * signal) / self.norms[index]
+                                      - np.square(self.mws[index]))
+            self.m4s[index] = dt * np.mean(np.power(signal_time, 4) * signal) / self.norms[index]
+            self.m4s[index] = np.sqrt((12. * np.square(self.mws[index])) ** 2
+                                      - (np.power(self.mws[index], 4) - self.m4s[index]) / 3.)
+        self.maximum_time_to_hs: NDArray[np.float_] = np.multiply(maximum_times, SOUND_SPEED / 2.)
 
-        # # TODO: apply filtering to `maximum_time_to_hs` to reject too deviant values
-        # values, counts = np.unique(maximum_time_to_hs, return_counts=True)
-        # counts = counts.astype(np.float_) / maximum_time_to_hs.size
+        # # TODO: apply filtering to `self.maximum_time_to_hs` to reject too deviant values
+        # values, counts = np.unique(self.maximum_time_to_hs, return_counts=True)
+        # counts = counts.astype(np.float_) / self.maximum_time_to_hs.size
         # threshold: float = 1e-3
         # values = values[counts > threshold]
-        # good = (maximum_time_to_hs >= np.min(values)) & (maximum_time_to_hs <= np.max(values))
-        # t0s = t0s[:maximum_time_to_hs.size][good]
-        # times = times[good]
-        # maximum_sns = maximum_sns[good]
-        # maximum_time_to_hs = maximum_time_to_hs[good]
-        # norms = norms[good]
-        # mws = mws[good]
-        # disps = disps[good]
-        # m4s = m4s[good]
+        # good = (self.maximum_time_to_hs >= np.min(values)) & (self.maximum_time_to_hs <= np.max(values))
+        # self.t0s = self.t0s[:self.maximum_time_to_hs.size][good]
+        # self.times = self.times[good]
+        # self.maximum_sns = self.maximum_sns[good]
+        # self.maximum_time_to_hs = self.maximum_time_to_hs[good]
+        # self.norms = self.norms[good]
+        # self.mws = self.mws[good]
+        # self.disps = self.disps[good]
+        # self.m4s = self.m4s[good]
 
-        if c.peak_parameters:
-            save_peaks_parameters()
-        if c.peak_parameters_plots:
-            save_peaks_parameters_plots()
+        self.rls: RLS = RLS(filename, c, self.t0s, self.maximum_time_to_hs)
 
-        if c.averaged_peaks_window < 1:
-            na = t0s.size
+    def av_pars(self, na: int, n_init: int = 0, n_fin: Optional[int] = None) -> Mapping[str, float]:
+        signal_time = np.mean(self.ts[n_init:n_fin], axis=0)
+        signal = np.mean(self.sns[n_init:n_fin], axis=0)
+        dt = abs(signal_time[-1] - self.h_t)
+        norm = dt * np.mean(signal)
+        mw = dt * np.mean(signal_time * signal) / norm
+        disp = dt * np.mean(np.square(signal_time) * signal) / norm - np.square(mw)
+        m4 = dt * np.mean(np.power(signal_time, 4) * signal) / norm
+        m4 = np.sqrt(np.square(12. * np.square(mw)) - (np.power(mw, 4) - m4) / 3.)
+        arg_max_sn = np.argmax(signal)
+        maximum_sn = signal[arg_max_sn]
+        maximum_time = signal_time[arg_max_sn]
+        return dict(zip(
+            'TIME NORM MW DISP M4 MAXSN TIMEMAXS'.split(),
+            (
+                np.mean(signal_time) + self.t0s[na + n_init - 1],
+                norm,
+                mw,
+                disp,
+                m4,
+                maximum_sn,
+                SOUND_SPEED * maximum_time / 2.,
+            )
+        ))
+
+    def alt(self) -> Dict[str, Union[float, int, NDArray[np.float_]]]:
+        na: int
+        if self.c.averaged_peaks_parameters_window < 1:
+            na = self.t0s.size
         else:
-            na = c.averaged_peaks_window
-        if na != 1 and c.averaged_peaks:
-            save_averaged_peaks()
+            na = self.c.averaged_peaks_parameters_window
+        return {'pulse count': self.t0s.size,
+                **self.av_pars(na),
+                **self.rls.rls()}
 
-        if c.averaged_peaks_parameters_window < 1:
-            na = t0s.size
+
+class Saviour(Altimeter):
+    def save_initial_signal(self) -> None:
+        if self.c.verbosity:
+            print('saving text to '
+                  f'{self.saving_path / (self.c.save_initial_signal_file_name + self.c.saving_extension)}...',
+                  end='', flush=True)
+        utils.save_txt(
+            self.saving_path / (self.c.save_initial_signal_file_name + self.c.saving_extension),
+            np.column_stack((self.t.astype(np.single), self.sn.astype(np.single), self.sc.astype(np.single))),
+            header=self.c.delimiter.join(('Time [s]', 'Signal [V]', 'Sync [V]')) if self.c.header else '',
+            fmt=self.c.delimiter.join(('%.7f', '%.8f', '%.8f')),
+            newline=os.linesep, encoding='utf-8')
+        if self.c.verbosity:
+            print(' done')
+
+    def save_parameters(self) -> None:
+        with (self.saving_path / 'parameters.txt').open('w', encoding='utf-8') as f_out:
+            f_out.write(str(self.parameters))
+            f_out.write(str(self.c))
+
+    def save_peaks(self) -> None:
+        def save_peak(i: int) -> None:
+            if self.c.verbosity > 1:
+                # display progress
+                print(f'\r{first_signal_index / self.first_signal_indexes[-1]:7.2%}', end='', flush=True)
+            utils.save_txt(
+                self.saving_path / f'{self.c.peak_files_prefix}{i + 1:0{index_width}}{self.c.saving_extension}',
+                np.column_stack((self.ts[i], self.sns[i])),
+                header='\n'.join((self.c.delimiter.join(('dt', 'self.sn')), f't0 = {t0}'))
+                if self.c.header else '',
+                fmt=('%.6f', '%.6f'),
+                delimiter=self.c.delimiter, newline=os.linesep, encoding='utf-8')
+
+        def save_peak_plot(i: int) -> None:
+            if self.c.verbosity > 1:
+                print('saving plot for peak', self.c.peak_plot_number)
+            fig, ax = plt.subplots()
+            fig.set_size_inches(self.c.peak_plot_width, self.c.peak_plot_height, forward=True)
+            fig.set_dpi(self.c.peak_plot_dpi)
+            ax.plot(self.ts[i], self.sns[i], color=self.c.peak_plot_line_color)
+            if self.c.peak_plot_x_grid:
+                ax.grid(axis='x')
+            if self.c.peak_plot_y_grid:
+                ax.grid(axis='y')
+            ax.set_xlabel('Время, с')
+            ax.set_ylabel('Сигнал, В')
+            fig.tight_layout()
+            (self.saving_path / self.c.img_directory).mkdir(exist_ok=True, parents=True)
+            fig.savefig(self.saving_path / self.c.img_directory
+                        / f'{self.c.peak_plot_file_name}.{self.c.peak_plot_file_format}',
+                        bbox_inches='tight')
+            plt.close(fig)
+
+        index_width: int = len(str(self.init_start_indices_size))
+        if self.c.peak_files and self.c.verbosity > 1:
+            print('saving peaks')
+        for index, (first_signal_index, t0) in enumerate(zip(self.first_signal_indexes, self.t0s)):
+            if self.c.peak_files:
+                save_peak(index)
+
+            if self.c.peak_plot and index + 1 == self.c.peak_plot_number:
+                save_peak_plot(index)
+
+        if self.c.verbosity > 1:
+            print('\r' + ' ' * 8 + '\r', end='', flush=True)
+
+    def save_peaks_parameters(self) -> None:
+        if self.c.verbosity > 1:
+            print('saving peaks parameters')
+        utils.save_txt(self.saving_path / (self.c.peak_parameters_file_name + self.c.saving_extension),
+                       np.column_stack((self.times,
+                                        self.norms,
+                                        self.mws,
+                                        self.disps,
+                                        self.m4s,
+                                        self.maximum_sns,
+                                        self.maximum_time_to_hs)),
+                       header=self.c.delimiter.join('TIME NORM MW DISP M4 MAXSN TIMEMAXS'.split())
+                       if self.c.header else '',
+                       fmt='%s',
+                       delimiter=self.c.delimiter, newline=os.linesep, encoding='utf-8')
+
+    def save_peaks_parameters_plots(self) -> None:
+        if self.c.verbosity > 1:
+            print('saving peaks parameters plots')
+        for peak_parameter, ax_label in zip(
+                (self.norms,
+                 self.mws,
+                 self.disps,
+                 self.m4s,
+                 self.maximum_sns,
+                 self.maximum_time_to_hs),
+                'NORM MW DISP M4 MAXSN TIMEMAXS'.split()
+        ):
+            fig, ax = plt.subplots()
+            fig.set_size_inches(self.c.peak_parameters_plots_width, self.c.peak_parameters_plots_height,
+                                forward=True)
+            fig.set_dpi(self.c.peak_parameters_plots_dpi)
+            ax.plot(self.times, peak_parameter, color=self.c.peak_parameters_plots_line_color)
+            if self.c.peak_parameters_plots_x_grid:
+                ax.grid(axis='x')
+            if self.c.peak_parameters_plots_y_grid:
+                ax.grid(axis='y')
+            ax.set_xlabel('Время, с')
+            # TODO: set y label
+            fig.tight_layout()
+            (self.saving_path / self.c.img_directory).mkdir(exist_ok=True, parents=True)
+            fig.savefig(self.saving_path / self.c.img_directory
+                        / f'{ax_label}.{self.c.peak_parameters_plots_file_format}',
+                        bbox_inches='tight')
+            plt.close(fig)
+
+    def save_averaged_peaks(self, na: int) -> None:
+        index_width: int = len(str(self.t0s.size // na))
+        if self.c.verbosity > 1:
+            print('saving averaged peaks')
+        for i, n in enumerate(range(0, self.t0s.size, na), start=1):
+            _signal_time = np.mean(self.ts[n:na + n], axis=0)
+            _signal = np.mean(self.sns[n:na + n], axis=0)
+            utils.save_txt(self.saving_path
+                           / f'{self.c.averaged_peaks_files_prefix}{i:0{index_width}}{self.c.saving_extension}',
+                           np.column_stack((_signal_time, _signal)),
+                           header=('\n'.join((self.c.delimiter.join(('dt', 'self.sn')),
+                                              f'time = {np.mean(_signal_time)}'))
+                                   if self.c.header else ''),
+                           fmt=('%.6f', '%.6f'),
+                           delimiter=self.c.delimiter, newline=os.linesep, encoding='utf-8')
+
+    def save_averaged_peaks_parameters(self, na: int) -> None:
+        if self.c.verbosity > 1:
+            print('saving averaged peaks parameters')
+        with ((self.saving_path / (self.c.averaged_peaks_parameters_file_name + self.c.saving_extension))
+                .open('w', encoding='utf-8')) as f_out:
+            if self.c.header:
+                f_out.write(self.c.delimiter.join('TIME NORM MW DISP M4 MAXSN TIMEMAXS'.split()) + '\n')
+            for i, n in enumerate(range(0, self.t0s.size, na)):
+                av_pars_dict = self.av_pars(na, n, na + n)
+                f_out.write(self.c.delimiter.join(map(str, av_pars_dict.values())) + '\n')
+
+    def save_averaged_peaks_plots(self, na: int) -> None:
+        if self.c.verbosity > 1:
+            print('saving averaged peaks plots')
+        for i, n in enumerate(range(0, self.t0s.size, na), start=1):
+            _signal_time = np.mean(self.ts[n:na + n], axis=0)
+            _signal = np.mean(self.sns[n:na + n], axis=0)
+            fig, ax = plt.subplots()
+            fig.set_size_inches(self.c.averaged_peak_plots_width, self.c.averaged_peak_plots_height, forward=True)
+            fig.set_dpi(self.c.averaged_peak_plots_dpi)
+            ax.plot(_signal_time, _signal, color=self.c.averaged_peak_plots_line_color)
+            if self.c.averaged_peak_plots_x_grid:
+                ax.grid(axis='x')
+            if self.c.averaged_peak_plots_y_grid:
+                ax.grid(axis='y')
+            ax.set_xlabel('Время, с')
+            ax.set_ylabel('Сигнал, В')
+            fig.tight_layout()
+            (self.saving_path / self.c.img_directory).mkdir(exist_ok=True, parents=True)
+            fig.savefig(self.saving_path / self.c.img_directory
+                        / f'{self.c.averaged_peak_plots_file_name_prefix}{i}.{self.c.psd_plot_file_format}',
+                        bbox_inches='tight')
+            plt.close(fig)
+
+    def save_statistics(self) -> None:
+        statistics_file_path: Path
+        if self.c.statistics_file_path.suffix == self.c.saving_extension:
+            statistics_file_path = self.c.statistics_file_path
         else:
-            na = c.averaged_peaks_parameters_window
-        if na != 1 and c.averaged_peaks_parameters:
-            save_averaged_peaks_parameters()
+            statistics_file_path = self.c.statistics_file_path.with_name(self.c.statistics_file_path.name
+                                                                         + self.c.saving_extension)
+        if self.c.verbosity > 1:
+            print('saving statistics to', statistics_file_path)
+        stat = {'filename': self.source_file_name.with_suffix(''),
+                'date&time': self.parameters.time.decode(),
+                **self.alt()}
+        if not statistics_file_path.exists():
+            with statistics_file_path.open('w', encoding='utf-8') as f_out:
+                f_out.write(self.c.delimiter.join(stat.keys()) + '\n')
+        with statistics_file_path.open('a', encoding='utf-8') as f_out:
+            f_out.write(self.c.delimiter.join(map(str, stat.values())) + '\n')
 
-        if c.averaged_peak_plots_window < 1:
-            na = t0s.size
+    def save_psd(self) -> None:
+        if self.c.verbosity > 1:
+            print('saving spectrum')
+        utils.save_txt(
+            self.saving_path / (self.c.psd_file_name + self.c.saving_extension),
+            np.column_stack((self.rls.f, self.rls.sp)),
+            header=self.c.delimiter.join(('Frequency [Hz]', 'PSD [V²/Hz]')) if self.c.header else '',
+            delimiter=self.c.delimiter, newline=os.linesep, encoding='utf-8')
+
+    def save_psd_plot(self) -> None:
+        if self.c.verbosity > 1:
+            print('saving spectrum plot')
+        fig, ax = plt.subplots()
+        fig.set_size_inches(self.c.psd_plot_width, self.c.psd_plot_height, forward=True)
+        fig.set_dpi(self.c.psd_plot_dpi)
+        ax.plot(self.rls.f, self.rls.sp, color=self.c.psd_plot_line_color)
+        if self.c.psd_plot_x_grid:
+            ax.grid(axis='x')
+        if self.c.psd_plot_y_grid:
+            ax.grid(axis='y')
+        ax.set_xlabel('Частота, Гц')
+        ax.set_ylabel('Спектральная плотность мощности, В²/Гц')
+        fig.tight_layout()
+        (self.saving_path / self.c.img_directory).mkdir(exist_ok=True, parents=True)
+        fig.savefig(self.saving_path / self.c.img_directory
+                    / f'{self.c.psd_plot_file_name}.{self.c.psd_plot_file_format}',
+                    bbox_inches='tight')
+        plt.close(fig)
+
+    def save_rolling_psd(self) -> None:
+        def save_averaged_rolling_psd() -> None:
+            if self.c.verbosity > 1:
+                print('saving averaged rolling spectra')
+            if rolling_pn_xxs is not None:
+                utils.save_txt(
+                    self.saving_path / f'{self.c.rolling_psd_averaged_file_name}{self.c.saving_extension}',
+                    np.column_stack((rolling_f, 2.0 * rolling_pn_xxs * self.rls.t_r2 / i)),
+                    header=self.c.delimiter.join(('Frequency [Hz]', 'PSD [V²/Hz]')) if self.c.header else '',
+                    delimiter=self.c.delimiter, newline=os.linesep, encoding='utf-8')
+            else:
+                print('ERROR: no rolling spectra has been calculated yet')
+
+        if self.c.verbosity > 1:
+            print('saving rolling spectra')
+
+        rolling_psd_window: float
+        if self.c.rolling_psd_window.endswith('%'):
+            rolling_psd_window = float(self.c.rolling_psd_window.rstrip('%')) / 100. \
+                                 / self.rls.f[np.argmax(self.rls.pn_xx)]
         else:
-            na = c.averaged_peak_plots_window
-        if na != 1 and c.averaged_peak_plots:
-            save_averaged_peaks_plots()
+            rolling_psd_window = float(self.c.rolling_psd_window)
+        if rolling_psd_window < self.rls.t_r2:
+            rolling_psd_window = 1. / self.rls.f[np.argmax(self.rls.pn_xx)]
 
-        return {'pulse count': t0s.size,
-                **av_pars(),
-                **rls(t0s, maximum_time_to_hs)}
+        rolling_psd_window_shift: float
+        if self.c.rolling_psd_window_shift.endswith('%'):
+            rolling_psd_window_shift = float(
+                self.c.rolling_psd_window_shift.rstrip('%')) / 100. * rolling_psd_window
+        else:
+            rolling_psd_window_shift = float(self.c.rolling_psd_window_shift)
 
-    saving_path: Path
-    source_file_name: Path
-    pars_file_name: Path
-    if filename.suffix.lower() == DAT_SUFFIX:
-        saving_path = filename.with_suffix('') / c.saving_directory
-        # файл исходных бинарных данных
-        source_file_name = filename
-        # файл параметров файла данных
-        pars_file_name = filename.with_suffix(PAR_SUFFIX)
-    else:
-        saving_path = filename.with_name(filename.name + '_result') / c.saving_directory
-        # файл исходных бинарных данных
-        source_file_name = filename.with_name(filename.name + DAT_SUFFIX)
-        # файл параметров файла данных
-        pars_file_name = filename.with_name(filename.name + PAR_SUFFIX)
-    if not source_file_name.exists() or not pars_file_name.exists():
-        return
-    saving_path.mkdir(exist_ok=True, parents=True)
+        index_width: int = len(str(int((self.rls.time[-1] - self.rls.time[0] - rolling_psd_window)
+                                       / rolling_psd_window_shift)))
+        i: int = 1
+        rolling_psd_window_start: float = self.rls.time[0]
+        rolling_psd_window_end: float = rolling_psd_window_start + rolling_psd_window
+        rolling_pn_xxs: Optional[NDArray[np.float_]] = None
+        rolling_f: Optional[NDArray[np.float_]] = None
+        rolling_psd_averaging_failed: bool = False
+        while self.rls.time[-1] >= rolling_psd_window_end:
+            rolling_ht: NDArray[np.float_] = \
+                self.rls.ht[np.argwhere((self.rls.time >= rolling_psd_window_start)
+                                        & (self.rls.time <= rolling_psd_window_end)).ravel()]
+            rolling_f, rolling_pn_xx = scipy.signal.welch(rolling_ht, 1. / self.rls.t_r2,
+                                                          window=(self.c.psd_window, *self.c.psd_window_parameters),
+                                                          nperseg=rolling_ht.size,
+                                                          average=self.c.psd_averaging_mode)
+            if rolling_pn_xxs is None:
+                rolling_pn_xxs = rolling_pn_xx
+            elif rolling_pn_xxs.shape == rolling_pn_xx.shape:
+                rolling_pn_xxs += rolling_pn_xx
+            else:
+                rolling_psd_averaging_failed = True
+            utils.save_txt(self.saving_path
+                           / f'{self.c.rolling_psd_files_prefix}{i:0{index_width}}{self.c.saving_extension}',
+                           np.column_stack((rolling_f, 2 * rolling_pn_xx * self.rls.t_r2)),
+                           header='\n'.join(
+                               (self.c.delimiter.join(('Frequency [Hz]', 'PSD [V²/Hz]')),
+                                f'time from {rolling_psd_window_start} to {rolling_psd_window_end} [s]')
+                           ) if self.c.header else '',
+                           delimiter=self.c.delimiter, newline=os.linesep, encoding='utf-8')
+            rolling_psd_window_start += rolling_psd_window_shift
+            rolling_psd_window_end = rolling_psd_window_start + rolling_psd_window
+            i += 1
+        if not rolling_psd_averaging_failed and rolling_f is not None and rolling_pn_xxs is not None:
+            save_averaged_rolling_psd()
 
-    fp_pars_file: BinaryIO
-    with pars_file_name.open('rb') as fp_pars_file:
-        # пробуем зачитать файл параметров
-        parameters = utils.LCardParameters(fp_pars_file)
+    def save_psd_statistics(self) -> None:
+        if self.c.verbosity > 1:
+            print('saving spectrum statistics')
+        utils.save_txt(self.saving_path / (self.c.psd_statistics_file_name + self.c.saving_extension),
+                       np.column_stack((self.rls.f, self.rls.sp,
+                                        np.square(2. * np.pi * self.rls.f) * self.rls.sp,
+                                        np.square(self.rls.k) * self.rls.sp,
+                                        np.power(self.rls.k, 4) * self.rls.sp)),
+                       header=self.c.delimiter.join(('Частота', 'Спектр_возвышений', 'Спектр_скоростей',
+                                                     'Спектр_наклонов', 'Спектр_кривизн')) if self.c.header else '',
+                       delimiter=self.c.delimiter, newline=os.linesep, encoding='utf-8')
 
-    fp_source_file: BinaryIO
-    t: NDArray[np.float_] = np.full(parameters.frames_count, np.nan)
-    sn: NDArray[np.float_] = np.full(parameters.frames_count, np.nan)
-    sc: NDArray[np.float_] = np.full(parameters.frames_count, np.nan)
-    samples_count_portion: int = round(psutil.virtual_memory().available / parameters.DATA_TYPE_SIZE / 16)
+    def save_integrals(self) -> None:
+        if self.c.verbosity > 1:
+            print('saving integrals')
+        utils.save_txt(self.saving_path / (self.c.integrals_file_name + self.c.saving_extension),
+                       np.column_stack(tuple(self.rls.integrals_dict.values())),
+                       header=self.c.delimiter.join(self.rls.integrals_dict.keys()) if self.c.header else '',
+                       delimiter=self.c.delimiter, newline=os.linesep, encoding='utf-8')
 
-    # read data frames
-    with source_file_name.open('rb', buffering=samples_count_portion) as fp_source_file:
-        if c.verbosity:
-            print('Processing', source_file_name)
-            if c.verbosity > 1:
-                print(parameters_str())
-        sc_frame_number: int = 0
-        sn_frame_number: int = 0
-        remaining_samples_count: int = parameters.samples_count
-        ch: int = 0
-        while remaining_samples_count > 0:
-            # прочитаем из файла очередную порция бинарных данных
-            data_buffer = utils.read_numpy_array(fp_source_file, parameters.DATA_NUMPY_TYPE,
-                                                 parameters.samples_count % samples_count_portion)
-            actual_samples_count: int = data_buffer.size
-            sc_frame_count: int = ((actual_samples_count + ch) // parameters.channels_count
-                                   - (ch > c.sync_channel)
-                                   + ((actual_samples_count + ch) % parameters.channels_count > c.sync_channel)
-                                   )
-            sn_frame_count: int = ((actual_samples_count + ch) // parameters.channels_count
-                                   - (ch > c.signal_channel)
-                                   + ((actual_samples_count + ch) % parameters.channels_count > c.signal_channel)
-                                   )
+    def save_all_requested(self) -> None:
+        if self.c.save_initial_signal:
+            self.save_initial_signal()
 
-            sc[sc_frame_number:sc_frame_number + sc_frame_count] = \
-                data_buffer[(parameters.channels_count - ch + c.sync_channel) % parameters.channels_count::
-                            parameters.channels_count]
-            sn[sn_frame_number:sn_frame_number + sn_frame_count] = \
-                data_buffer[(parameters.channels_count - ch + c.signal_channel) % parameters.channels_count::
-                            parameters.channels_count]
+        self.save_parameters()
 
-            sc_frame_number += sc_frame_count
-            sn_frame_number += sn_frame_count
+        self.save_peaks()
 
-            ch = (ch + actual_samples_count) % parameters.channels_count
+        if self.c.peak_parameters:
+            self.save_peaks_parameters()
+        if self.c.peak_parameters_plots:
+            self.save_peaks_parameters_plots()
 
-            if not actual_samples_count:
-                print('Unexpected end of file', source_file_name)
-                break
+        na: int
 
-            remaining_samples_count -= actual_samples_count
-        t[:sc_frame_number] = np.arange(sc_frame_number) * 1e-3 / parameters.channel_rate
-    sc += parameters.correction_offset[0]
-    sn += parameters.correction_offset[0]
-    if not parameters.RESCALING_REQUIRED:
-        sc *= parameters.correction_factor[0]
-        sn *= parameters.correction_factor[0]
-    elif parameters.MAX_ADC_CODE:
-        sc *= (parameters.correction_factor[0] / parameters.MAX_ADC_CODE * parameters.MAX_ADC_VOLTAGE)
-        sn *= (parameters.correction_factor[0] / parameters.MAX_ADC_CODE * parameters.MAX_ADC_VOLTAGE)
+        if self.c.averaged_peaks_window < 1:
+            na = self.t0s.size
+        else:
+            na = self.c.averaged_peaks_window
+        if na != 1 and self.c.averaged_peaks:
+            self.save_averaged_peaks(na)
 
-    if c.save_initial_signal:
-        save_initial_signal()
+        if self.c.averaged_peaks_parameters_window < 1:
+            na = self.t0s.size
+        else:
+            na = self.c.averaged_peaks_parameters_window
+        if na != 1 and self.c.averaged_peaks_parameters:
+            self.save_averaged_peaks_parameters(na)
 
-    save_parameters()
+        if self.c.averaged_peak_plots_window < 1:
+            na = self.t0s.size
+        else:
+            na = self.c.averaged_peak_plots_window
+        if na != 1 and self.c.averaged_peak_plots:
+            self.save_averaged_peaks_plots(na)
 
-    if not np.isnan(t[0]) and not np.isnan(sn[0]) and not np.isnan(sc[0]):
-        stat = {'filename': source_file_name.with_suffix(''),
-                'date&time': parameters.time.decode(),
-                **alt()}
-        if c.statistics:
-            save_statistics()
+        if self.c.psd:
+            self.save_psd()
+
+        if self.c.psd_plot:
+            self.save_psd_plot()
+
+        if self.c.rolling_psd:
+            self.save_rolling_psd()
+
+        if self.c.integrals:
+            self.save_integrals()
+
+        if self.c.psd_statistics:
+            self.save_psd_statistics()
+
+        if not np.isnan(self.t[0]) and not np.isnan(self.sn[0]) and not np.isnan(self.sc[0]):
+            if self.c.statistics:
+                self.save_statistics()
+
+
+def process(filename: Path, c: Config) -> None:
+    saviour: Saviour = Saviour(filename, c)
+    saviour.save_all_requested()
 
 
 if __name__ == '__main__':
