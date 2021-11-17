@@ -4,7 +4,7 @@ import struct
 import sys
 from io import BufferedReader
 from pathlib import Path
-from typing import Tuple, Union, Dict, List, Type, BinaryIO, Optional
+from typing import Tuple, Union, Dict, List, Type, BinaryIO, Optional, Any, Iterable
 
 import numpy as np
 from numpy.typing import NDArray, ArrayLike
@@ -135,6 +135,16 @@ class LCardParameters:
         else:
             raise NotImplementedError(f'Unknown device type: {self.device_name!r}')
 
+    def __str__(self) -> str:
+        s: List[str] = []
+        parameter_name: str
+        for parameter_name in self.parameter_names:
+            parameter_value: Any = getattr(self, parameter_name)
+            if isinstance(parameter_value, bytes):
+                parameter_value = parameter_value.decode()
+            s.append(f'{parameter_name.replace("_", " ")}: {parameter_value}')
+        return '\n'.join(s)
+
 
 def read_array(source: Union[bytes, BinaryIO], _type: str, count: int = 1) -> Tuple[Union[float, int, bool], ...]:
     if count < 1:
@@ -183,9 +193,9 @@ def read_numpy_array(source: Union[bytes, BinaryIO], _type: Type[np.generic], co
     return data
 
 
-def save_txt(filename: Path, x: ArrayLike, fmt: Union[str, Tuple[str]] = '%.18e',
+def save_txt(filename: Path, x: ArrayLike, fmt: Union[str, Iterable[str]] = '%.18e',
              delimiter: str = ' ', newline: str = os.linesep,
-             header: str = '', footer: str = '', comments: str = '# ', encoding: Optional[str] = None) -> None:
+             header: str = '', footer: str = '', comments: str = '# ', encoding: Optional[str] = 'utf-8') -> None:
     """
     from `numpy.savetxt`
 
@@ -323,24 +333,25 @@ def save_txt(filename: Path, x: ArrayLike, fmt: Union[str, Tuple[str]] = '%.18e'
 
         with filename.open('wt', encoding=encoding, newline=newline) as fh:
             if header:
-                header = header.replace(newline, newline + comments)
-                fh.write(comments + header + newline)
+                header = header.replace('\n', '\n' + comments)
+                fh.write(comments + header + '\n')
             row_pack: int = 100000
-            row_pack_fmt = newline.join([fmt] * row_pack)
+            row_pack_fmt: str
+            row_pack_fmt = '\n'.join([fmt] * row_pack) + '\n'
             for row in range(0, x.shape[0] - row_pack, row_pack):
                 try:
-                    fh.write(row_pack_fmt % tuple(x[row:row + row_pack, ...].ravel()) + newline)
+                    fh.write(row_pack_fmt % tuple(x[row:row + row_pack, ...].ravel()))
                 except TypeError:
                     raise TypeError('Mismatch between array data type and format specifier')
             row_pack = x.shape[0] % row_pack
-            row_pack_fmt = newline.join([fmt] * row_pack)
+            row_pack_fmt = '\n'.join([fmt] * row_pack) + '\n'
             try:
-                fh.write(row_pack_fmt % tuple(x[-row_pack:, ...].ravel()) + newline)
+                fh.write(row_pack_fmt % tuple(x[-row_pack:, ...].ravel()))
             except TypeError:
                 raise TypeError('Mismatch between array data type and format specifier')
 
             if footer:
-                footer = footer.replace(newline, newline + comments)
-                fh.write(comments + footer + newline)
+                footer = footer.replace('\n', '\n' + comments)
+                fh.write(comments + footer + '\n')
     finally:
         pass
