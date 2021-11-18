@@ -269,7 +269,8 @@ class Reader:
             self.parameters: utils.LCardParameters = utils.LCardParameters(fp_pars_file)
 
         fp_source_file: BinaryIO
-        self.t: NDArray[np.float_] = np.full(self.parameters.frames_count, np.nan)
+        self.t_sn: NDArray[np.float_] = np.full(self.parameters.frames_count, np.nan)
+        self.t_sc: NDArray[np.float_] = np.full(self.parameters.frames_count, np.nan)
         self.sn: NDArray[np.float_] = np.full(self.parameters.frames_count, np.nan)
         self.sc: NDArray[np.float_] = np.full(self.parameters.frames_count, np.nan)
         self.samples_count_portion: int = round(psutil.virtual_memory().available / self.parameters.DATA_TYPE_SIZE / 16)
@@ -319,7 +320,8 @@ class Reader:
                     break
 
                 remaining_samples_count -= actual_samples_count
-            self.t[:sc_frame_number] = np.arange(sc_frame_number) * 1e-3 / self.parameters.channel_rate
+        self.t_sn[:sn_frame_number] = np.arange(sn_frame_number) * 1e-3 / self.parameters.channel_rate
+        self.t_sc[:sc_frame_number] = np.arange(sc_frame_number) * 1e-3 / self.parameters.channel_rate
         self.sc += self.parameters.correction_offset[0]
         self.sn += self.parameters.correction_offset[0]
         if not self.parameters.RESCALING_REQUIRED:
@@ -444,30 +446,30 @@ class Altimeter(Reader):
         self.signal_durations: List[int] = []
         first_signal_index: int
         last_signal_index: int
+        t0: np.float_
         while start_indices.size:
-            t0 = self.t[start_indices[0] + 1]
-            if self.t[-1] < h_max_t + t0:
+            t0 = self.t_sc[start_indices[0] + 1]
+            if self.t_sn[-1] < h_max_t + t0:
                 break
             self.t0s = np.append(self.t0s, t0)
-            first_signal_index = np.searchsorted(self.t, self.h_t + t0, side='right')
-            last_signal_index = np.searchsorted(self.t, h_max_t + t0, side='right')
+            first_signal_index = np.searchsorted(self.t_sn, self.h_t + t0, side='right')
+            last_signal_index = np.searchsorted(self.t_sn, h_max_t + t0, side='right')
             self.first_signal_indexes.append(first_signal_index)
             self.signal_durations.append(last_signal_index - first_signal_index)
             start_indices = start_indices[start_indices > last_signal_index]
 
         index: int
         start_time: float
-        signal_time: NDArray[np.float_]
-        signal: NDArray[np.float_]
-
         max_signal_duration: int = max(self.signal_durations)
         for index, (first_signal_index, t0) in enumerate(zip(self.first_signal_indexes, self.t0s)):
             last_signal_index = first_signal_index + max_signal_duration
-            self.ts.append(self.t[first_signal_index:last_signal_index] - t0)
+            self.ts.append(self.t_sn[first_signal_index:last_signal_index] - t0)
             self.sns.append(self.sn[first_signal_index:last_signal_index])
 
         arg_max_sns: List[int] = []
         arg_max_sn: int
+        signal_time: NDArray[np.float_]
+        signal: NDArray[np.float_]
         for signal_time, signal in zip(self.ts, self.sns):
             arg_max_sn = cast(int, np.argmax(signal))
             arg_max_sns.append(arg_max_sn)
@@ -549,18 +551,25 @@ class Altimeter(Reader):
 
 class Saviour(Altimeter):
     def save_initial_signal(self) -> None:
-        if self.c.verbosity:
-            print('saving text to '
-                  f'{self.saving_path / (self.c.save_initial_signal_file_name + self.c.saving_extension)}...',
-                  end='', flush=True)
-        utils.save_txt(
-            self.saving_path / (self.c.save_initial_signal_file_name + self.c.saving_extension),
-            np.column_stack((self.t.astype(np.single), self.sn.astype(np.single), self.sc.astype(np.single))),
-            header=self.c.delimiter.join(('Time [s]', 'Signal [V]', 'Sync [V]')) if self.c.header else '',
-            fmt=self.c.delimiter.join(('%.7f', '%.8f', '%.8f')),
-            newline=os.linesep, encoding='utf-8')
-        if self.c.verbosity:
-            print(' done')
+        def save_channel(channel_name: str, column_name: str,
+                         channel_time: NDArray[np.float_], channel_voltage: NDArray[np.float_]) -> None:
+            (self.saving_path / str(channel_name)).mkdir(exist_ok=True)
+            saving_location: Path = (self.saving_path
+                                     / str(channel_name)
+                                     / (self.c.save_initial_signal_file_name + self.c.saving_extension))
+            if self.c.verbosity:
+                print(f'saving {channel_name} data to {saving_location}...', end='', flush=True)
+            utils.save_txt(
+                saving_location,
+                np.column_stack((channel_time.astype(np.single), channel_voltage.astype(np.single))),
+                header=self.c.delimiter.join(('Time [s]', column_name)) if self.c.header else '',
+                fmt=self.c.delimiter.join(('%.7f', '%.8f')),
+                newline=os.linesep, encoding='utf-8')
+            if self.c.verbosity:
+                print(' done')
+
+        save_channel('sn', 'Signal [V]', self.t_sn, self.sn)
+        save_channel('sc', 'Sync [V]', self.t_sc, self.sc)
 
     def save_parameters(self) -> None:
         with (self.saving_path / 'parameters.txt').open('w', encoding='utf-8') as f_out:
@@ -572,7 +581,7 @@ class Saviour(Altimeter):
         utils.save_txt(
             self.saving_path / f'{self.c.peak_files_prefix}{i + 1:0{index_width}}{self.c.saving_extension}',
             np.column_stack((self.ts[i], self.sns[i])),
-            header='\n'.join((self.c.delimiter.join(('dt', 'self.sn')), f't0 = {t0}'))
+            header='\n'.join((self.c.delimiter.join(('dt', 'sn')), f't0 = {t0}'))
             if self.c.header else '',
             fmt=('%.6f', '%.6f'),
             delimiter=self.c.delimiter, newline=os.linesep, encoding='utf-8')
@@ -600,11 +609,11 @@ class Saviour(Altimeter):
     def save_peaks(self) -> None:
         if self.c.peak_files and self.c.verbosity > 1:
             print('saving peaks')
-        for index, (first_signal_index, t0) in enumerate(zip(self.first_signal_indexes, self.t0s)):
+        for index, t0 in enumerate(self.t0s):
             if self.c.peak_files:
                 if self.c.verbosity > 1:
                     # display progress
-                    print(f'\r{first_signal_index / self.first_signal_indexes[-1]:7.2%}', end='', flush=True)
+                    print(f'\r{(index + 1) / self.t0s.size:7.2%}', end='', flush=True)
                 self.save_peak(index, t0)
 
             if self.c.peak_plot and index + 1 == self.c.peak_plot_number:
@@ -895,7 +904,7 @@ class Saviour(Altimeter):
         if self.c.psd_statistics:
             self.save_psd_statistics()
 
-        if not np.isnan(self.t[0]) and not np.isnan(self.sn[0]) and not np.isnan(self.sc[0]):
+        if not np.isnan(self.t_sn[0]) and not np.isnan(self.sn[0]) and not np.isnan(self.sc[0]):
             if self.c.statistics:
                 self.save_statistics()
 
