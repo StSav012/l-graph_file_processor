@@ -442,13 +442,15 @@ class Altimeter(Reader):
         self.sns: List[NDArray[np.float_]] = []
         self.first_signal_indexes: List[int] = []
         self.signal_durations: List[int] = []
+        first_signal_index: int
+        last_signal_index: int
         while start_indices.size:
             t0 = self.t[start_indices[0] + 1]
             if self.t[-1] < h_max_t + t0:
                 break
             self.t0s = np.append(self.t0s, t0)
-            first_signal_index: int = np.searchsorted(self.t, self.h_t + t0, side='right')
-            last_signal_index: int = np.searchsorted(self.t, h_max_t + t0, side='right')
+            first_signal_index = np.searchsorted(self.t, self.h_t + t0, side='right')
+            last_signal_index = np.searchsorted(self.t, h_max_t + t0, side='right')
             self.first_signal_indexes.append(first_signal_index)
             self.signal_durations.append(last_signal_index - first_signal_index)
             start_indices = start_indices[start_indices > last_signal_index]
@@ -459,12 +461,10 @@ class Altimeter(Reader):
         signal: NDArray[np.float_]
 
         max_signal_duration: int = max(self.signal_durations)
-        if self.c.peak_files and self.c.verbosity > 1:
-            print('saving peaks')
         for index, (first_signal_index, t0) in enumerate(zip(self.first_signal_indexes, self.t0s)):
-            _last_signal_index: int = first_signal_index + max_signal_duration
-            self.ts.append(self.t[first_signal_index:_last_signal_index] - t0)
-            self.sns.append(self.sn[first_signal_index:_last_signal_index])
+            last_signal_index = first_signal_index + max_signal_duration
+            self.ts.append(self.t[first_signal_index:last_signal_index] - t0)
+            self.sns.append(self.sn[first_signal_index:last_signal_index])
 
         arg_max_sns: List[int] = []
         arg_max_sn: int
@@ -567,7 +567,7 @@ class Saviour(Altimeter):
             f_out.write(str(self.parameters))
             f_out.write(str(self.c))
 
-    def save_peak(self, i: int, t0: np.float64) -> None:
+    def save_peak(self, i: int, t0: np.float_) -> None:
         index_width: int = len(str(self.init_start_indices_size))
         utils.save_txt(
             self.saving_path / f'{self.c.peak_files_prefix}{i + 1:0{index_width}}{self.c.saving_extension}',
