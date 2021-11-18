@@ -240,7 +240,7 @@ def main(c: Config) -> None:
         print('done')
 
 
-class Processor:
+class Reader:
     def __init__(self, filename: Path, c: Config) -> None:
         self.c: Config = c
 
@@ -336,34 +336,32 @@ def k_f(f15: NDArray[np.float_]) -> NDArray[np.float_]:
     water_surface_tension: Final[float] = 0.000074  # [N/mm]
     g: Final[float] = 9.8  # [m/s²]
 
-    _omega_squared: Final[NDArray[np.float_]] = np.square(2.0 * np.pi * f15)  # [1/s²]
+    omega_squared: Final[NDArray[np.float_]] = np.square(2.0 * np.pi * f15)  # [1/s²]
     q15: Final[NDArray[np.float_]] = ((g / water_surface_tension / 3) ** 3
-                                      + np.square(_omega_squared / water_surface_tension / 2))
-    k15: Final[NDArray[np.float_]] = (np.cbrt(np.sqrt(q15) + _omega_squared / water_surface_tension / 2)
-                                      - np.cbrt(np.sqrt(q15) - _omega_squared / water_surface_tension / 2))
+                                      + np.square(omega_squared / water_surface_tension / 2))
+    k15: Final[NDArray[np.float_]] = (np.cbrt(np.sqrt(q15) + omega_squared / water_surface_tension / 2)
+                                      - np.cbrt(np.sqrt(q15) - omega_squared / water_surface_tension / 2))
     return k15
 
 
-class RLS(Processor):
-    def __init__(self, filename: Path, c: Config, time: NDArray[np.float_], ht: NDArray[np.float_]) -> None:
-        super().__init__(filename, c)
-
+class RLS:
+    def __init__(self, c: Config, time: NDArray[np.float_], ht: NDArray[np.float_]) -> None:
         self.time: NDArray[np.float_] = time
         self.ht: NDArray[np.float_] = ht
 
         self.t_r2: float = self.time[-1] - self.time[-2]
         self.ht -= np.mean(self.ht)
-        self.ht *= self.c.calibration_factor
+        self.ht *= c.calibration_factor
 
         self.f: NDArray[np.float_]
         self.pn_xx: NDArray[np.float_]
         self.f, self.pn_xx = scipy.signal.welch(self.ht, 1. / self.t_r2,
-                                                window=(self.c.psd_window, *self.c.psd_window_parameters),
+                                                window=(c.psd_window, *c.psd_window_parameters),
                                                 # nperseg=ht.size,
-                                                average=self.c.psd_averaging_mode
+                                                average=c.psd_averaging_mode
                                                 )
-        self.pn_xx = self.pn_xx[self.f <= self.c.psd_max_frequency]
-        self.f = self.f[self.f <= self.c.psd_max_frequency]
+        self.pn_xx = self.pn_xx[self.f <= c.psd_max_frequency]
+        self.f = self.f[self.f <= c.psd_max_frequency]
         self.sp: Final[NDArray[np.float_]] = np.multiply(self.pn_xx, 2.0 * self.t_r2)
 
         self.dvtt: NDArray[np.float_] = (self.ht[1:] - self.ht[:-1]) / (self.time[1:] - self.time[:-1])
@@ -371,7 +369,7 @@ class RLS(Processor):
         self.df: NDArray[np.float_] = self.f[1:] - self.f[:-1]
 
         self.k = k_f(self.f)
-        self.integrals_dict: Dict[str, float] = self.integrals()
+        self.integrals_dict: Dict[str, float] = dict()
 
     def integrals(self) -> Dict[str, float]:
         sigma_hs: float = cast(float, np.sum(self.sp[1:] * self.df))
@@ -424,18 +422,20 @@ class RLS(Processor):
         ))
 
     def rls(self) -> Mapping[str, float]:
+        if not self.integrals_dict:
+            self.integrals_dict = self.integrals()
         return self.integrals_dict
 
 
-class Altimeter(Processor):
+class Altimeter(Reader):
     def __init__(self, filename: Path, c: Config) -> None:
         super().__init__(filename, c)
 
         self.h_t: Final[float] = self.c.min_depth * 2. / SOUND_SPEED
         h_max_t: Final[float] = self.c.max_depth * 2. / SOUND_SPEED
 
-        start_indices = np.argwhere((self.sc[1:] > self.c.sync_threshold)
-                                    & (self.sc[:-1] <= self.c.sync_threshold)).ravel()
+        start_indices: NDArray[np.int_] = np.argwhere((self.sc[1:] > self.c.sync_threshold)
+                                                      & (self.sc[:-1] <= self.c.sync_threshold)).ravel()
         self.init_start_indices_size: int = start_indices.size
         self.t0s: NDArray[np.float_] = np.empty(0)
         self.ts: List[NDArray[np.float_]] = []
@@ -447,8 +447,8 @@ class Altimeter(Processor):
             if self.t[-1] < h_max_t + t0:
                 break
             self.t0s = np.append(self.t0s, t0)
-            first_signal_index = np.searchsorted(self.t, self.h_t + t0, side='right')
-            last_signal_index = np.searchsorted(self.t, h_max_t + t0, side='right')
+            first_signal_index: int = np.searchsorted(self.t, self.h_t + t0, side='right')
+            last_signal_index: int = np.searchsorted(self.t, h_max_t + t0, side='right')
             self.first_signal_indexes.append(first_signal_index)
             self.signal_durations.append(last_signal_index - first_signal_index)
             start_indices = start_indices[start_indices > last_signal_index]
@@ -509,7 +509,7 @@ class Altimeter(Processor):
         # self.disps = self.disps[good]
         # self.m4s = self.m4s[good]
 
-        self.rls: RLS = RLS(filename, c, self.t0s, self.maximum_time_to_hs)
+        self.rls: RLS = RLS(c, self.t0s, self.maximum_time_to_hs)
 
     def av_pars(self, na: int, n_init: int = 0, n_fin: Optional[int] = None) -> Mapping[str, float]:
         signal_time = np.mean(self.ts[n_init:n_fin], axis=0)
@@ -567,48 +567,48 @@ class Saviour(Altimeter):
             f_out.write(str(self.parameters))
             f_out.write(str(self.c))
 
-    def save_peaks(self) -> None:
-        def save_peak(i: int) -> None:
-            if self.c.verbosity > 1:
-                # display progress
-                print(f'\r{first_signal_index / self.first_signal_indexes[-1]:7.2%}', end='', flush=True)
-            utils.save_txt(
-                self.saving_path / f'{self.c.peak_files_prefix}{i + 1:0{index_width}}{self.c.saving_extension}',
-                np.column_stack((self.ts[i], self.sns[i])),
-                header='\n'.join((self.c.delimiter.join(('dt', 'self.sn')), f't0 = {t0}'))
-                if self.c.header else '',
-                fmt=('%.6f', '%.6f'),
-                delimiter=self.c.delimiter, newline=os.linesep, encoding='utf-8')
-
-        def save_peak_plot(i: int) -> None:
-            if self.c.verbosity > 1:
-                print('saving plot for peak', self.c.peak_plot_number)
-            fig, ax = plt.subplots()
-            fig.set_size_inches(self.c.peak_plot_width, self.c.peak_plot_height, forward=True)
-            fig.set_dpi(self.c.peak_plot_dpi)
-            ax.plot(self.ts[i], self.sns[i], color=self.c.peak_plot_line_color)
-            if self.c.peak_plot_x_grid:
-                ax.grid(axis='x')
-            if self.c.peak_plot_y_grid:
-                ax.grid(axis='y')
-            ax.set_xlabel('Время, с')
-            ax.set_ylabel('Сигнал, В')
-            fig.tight_layout()
-            (self.saving_path / self.c.img_directory).mkdir(exist_ok=True, parents=True)
-            fig.savefig(self.saving_path / self.c.img_directory
-                        / f'{self.c.peak_plot_file_name}.{self.c.peak_plot_file_format}',
-                        bbox_inches='tight')
-            plt.close(fig)
-
+    def save_peak(self, i: int, t0: np.float64) -> None:
         index_width: int = len(str(self.init_start_indices_size))
+        utils.save_txt(
+            self.saving_path / f'{self.c.peak_files_prefix}{i + 1:0{index_width}}{self.c.saving_extension}',
+            np.column_stack((self.ts[i], self.sns[i])),
+            header='\n'.join((self.c.delimiter.join(('dt', 'self.sn')), f't0 = {t0}'))
+            if self.c.header else '',
+            fmt=('%.6f', '%.6f'),
+            delimiter=self.c.delimiter, newline=os.linesep, encoding='utf-8')
+
+    def save_peak_plot(self, i: int) -> None:
+        if self.c.verbosity > 1:
+            print('saving plot for peak', self.c.peak_plot_number)
+        fig, ax = plt.subplots()
+        fig.set_size_inches(self.c.peak_plot_width, self.c.peak_plot_height, forward=True)
+        fig.set_dpi(self.c.peak_plot_dpi)
+        ax.plot(self.ts[i], self.sns[i], color=self.c.peak_plot_line_color)
+        if self.c.peak_plot_x_grid:
+            ax.grid(axis='x')
+        if self.c.peak_plot_y_grid:
+            ax.grid(axis='y')
+        ax.set_xlabel('Время, с')
+        ax.set_ylabel('Сигнал, В')
+        fig.tight_layout()
+        (self.saving_path / self.c.img_directory).mkdir(exist_ok=True, parents=True)
+        fig.savefig(self.saving_path / self.c.img_directory
+                    / f'{self.c.peak_plot_file_name}.{self.c.peak_plot_file_format}',
+                    bbox_inches='tight')
+        plt.close(fig)
+
+    def save_peaks(self) -> None:
         if self.c.peak_files and self.c.verbosity > 1:
             print('saving peaks')
         for index, (first_signal_index, t0) in enumerate(zip(self.first_signal_indexes, self.t0s)):
             if self.c.peak_files:
-                save_peak(index)
+                if self.c.verbosity > 1:
+                    # display progress
+                    print(f'\r{first_signal_index / self.first_signal_indexes[-1]:7.2%}', end='', flush=True)
+                self.save_peak(index, t0)
 
             if self.c.peak_plot and index + 1 == self.c.peak_plot_number:
-                save_peak_plot(index)
+                self.save_peak_plot(index)
 
         if self.c.verbosity > 1:
             print('\r' + ' ' * 8 + '\r', end='', flush=True)
@@ -840,8 +840,8 @@ class Saviour(Altimeter):
         if self.c.verbosity > 1:
             print('saving integrals')
         utils.save_txt(self.saving_path / (self.c.integrals_file_name + self.c.saving_extension),
-                       np.column_stack(tuple(self.rls.integrals_dict.values())),
-                       header=self.c.delimiter.join(self.rls.integrals_dict.keys()) if self.c.header else '',
+                       np.column_stack(tuple(self.rls.rls().values())),
+                       header=self.c.delimiter.join(self.rls.rls().keys()) if self.c.header else '',
                        delimiter=self.c.delimiter, newline=os.linesep, encoding='utf-8')
 
     def save_all_requested(self) -> None:
