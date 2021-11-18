@@ -207,7 +207,7 @@ def save_txt(filename: Path, x: ArrayLike, fmt: Union[str, Iterable[str]] = '%.1
         If the filename ends in ``.gz``, the file is automatically saved in
         compressed gzip format.  `loadtxt` understands gzipped files
         transparently.
-    x : {np.ndarray}
+    x : {ArrayLike}
         1D or 2D array_like
         Data to be saved to a text file.
     fmt : str or sequence of strs, optional
